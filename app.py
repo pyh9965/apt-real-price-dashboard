@@ -7,15 +7,15 @@ from datetime import datetime, timedelta
 
 # API 관련 모듈 임포트
 try:
-    from api_client import ApartmentTradeAPI, test_api_connection
-    from region_codes import SEOUL_REGION_CODES, GYEONGGI_REGION_CODES, get_all_region_codes
+    from api_client import ApartmentTradeAPI, OfficetelTradeAPI, test_api_connection
+    from region_codes import get_region_codes_by_province
     API_AVAILABLE = True
 except ImportError:
     API_AVAILABLE = False
 
 # 페이지 설정
 st.set_page_config(
-    page_title="아파트 실거래가 분석 대시보드",
+    page_title="실거래가 분석 대시보드",
     page_icon="🏢",
     layout="wide"
 )
@@ -167,10 +167,13 @@ def load_data_from_upload(uploaded_file):
     return preprocess_data(df)
 
 # API에서 데이터 로드 함수
-def load_data_from_api(region_code, start_month, end_month, service_key=None):
-    """API에서 데이터 로드"""
+def load_data_from_api(region_code, start_month, end_month, service_key=None, property_type="아파트"):
+    """API에서 데이터 로드 (아파트 또는 오피스텔)"""
     try:
-        api = ApartmentTradeAPI(service_key)
+        if property_type == "오피스텔":
+            api = OfficetelTradeAPI(service_key)
+        else:
+            api = ApartmentTradeAPI(service_key)
 
         # 진행 상황 표시
         progress_bar = st.progress(0)
@@ -238,7 +241,7 @@ def preprocess_api_data(df):
 
 # 메인 함수
 def main():
-    st.title("📊 아파트 실거래가 상세 분석")
+    st.title("📊 실거래가 상세 분석 (아파트 / 오피스텔)")
 
     # 데이터 소스 초기화
     df = None
@@ -259,6 +262,14 @@ def main():
     # API 조회 모드
     if data_source == "🌐 API 조회" and API_AVAILABLE:
         with st.sidebar.expander("🌐 API 설정", expanded=True):
+            # 부동산 유형 선택
+            property_type = st.radio(
+                "부동산 유형",
+                ["아파트", "오피스텔"],
+                horizontal=True,
+                help="조회할 부동산 유형을 선택하세요"
+            )
+
             # API 키 설정
             api_key_input = st.text_input(
                 "API 인증키 (선택사항)",
@@ -266,16 +277,26 @@ def main():
                 help=".env 파일에 설정된 키를 사용하려면 비워두세요"
             )
 
-            # 지역 선택
-            all_regions = get_all_region_codes()
-            region_options = {f"{name} ({code})": code for code, name in all_regions.items()}
+            # 지역 선택 (2단계: 시/도 → 구/시/군)
+            province_map = get_region_codes_by_province()
 
-            selected_region_display = st.selectbox(
-                "지역 선택",
-                options=list(region_options.keys()),
-                index=list(region_options.keys()).index("서울 마포구 (11440)") if "서울 마포구 (11440)" in region_options else 0
+            selected_province = st.selectbox(
+                "시/도",
+                options=list(province_map.keys()),
+                index=0,
             )
-            selected_region_code = region_options[selected_region_display]
+
+            district_map = province_map[selected_province]
+            district_names = list(district_map.values())
+            district_codes = list(district_map.keys())
+
+            default_idx = 0
+            if selected_province == "서울" and "마포구" in district_names:
+                default_idx = district_names.index("마포구")
+
+            selected_district_name = st.selectbox("구/시/군", district_names, index=default_idx)
+            selected_region_code = district_codes[district_names.index(selected_district_name)]
+            selected_region_display = f"{selected_province} {selected_district_name}"
 
             # 기간 선택
             col1, col2 = st.columns(2)
@@ -284,11 +305,11 @@ def main():
             default_start = current_date - timedelta(days=180)  # 6개월 전
 
             with col1:
-                start_year = st.selectbox("시작 연도", range(2024, current_date.year + 1), index=0)
+                start_year = st.selectbox("시작 연도", range(2006, current_date.year + 1), index=current_date.year - 2007)
                 start_month = st.selectbox("시작 월", range(1, 13), index=default_start.month - 1)
 
             with col2:
-                end_year = st.selectbox("종료 연도", range(2024, current_date.year + 1), index=current_date.year - 2024)
+                end_year = st.selectbox("종료 연도", range(2006, current_date.year + 1), index=current_date.year - 2006)
                 end_month = st.selectbox("종료 월", range(1, 13), index=current_date.month - 1)
 
             start_ym = f"{start_year}{start_month:02d}"
@@ -308,11 +329,12 @@ def main():
             if st.button("🔍 데이터 조회", type="primary"):
                 with st.spinner("데이터를 불러오는 중..."):
                     service_key = api_key_input if api_key_input else None
-                    df = load_data_from_api(selected_region_code, start_ym, end_ym, service_key)
+                    df = load_data_from_api(selected_region_code, start_ym, end_ym, service_key, property_type)
 
                     if df is not None and len(df) > 0:
                         st.session_state['api_data'] = df
                         st.session_state['api_region'] = selected_region_display
+                        st.session_state['api_property_type'] = property_type
                         st.success(f"✅ {len(df):,}건의 데이터를 불러왔습니다!")
                     else:
                         st.warning("조회된 데이터가 없습니다. 기간이나 지역을 확인해주세요.")
@@ -320,7 +342,8 @@ def main():
         # 세션에서 데이터 로드
         if 'api_data' in st.session_state:
             df = st.session_state['api_data']
-            st.sidebar.success(f"✅ {st.session_state.get('api_region', 'API')} 데이터 로드됨")
+            loaded_type = st.session_state.get('api_property_type', '아파트')
+            st.sidebar.success(f"✅ [{loaded_type}] {st.session_state.get('api_region', 'API')} 데이터 로드됨")
 
     # 파일 업로드 모드
     else:

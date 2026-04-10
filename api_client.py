@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-국토교통부 아파트 매매 실거래가 API 클라이언트
+국토교통부 실거래가 API 클라이언트 (아파트 매매 / 오피스텔 매매)
 """
 
 import requests
@@ -310,6 +310,156 @@ class ApartmentTradeAPI:
         # NO 컬럼 추가 (인덱스)
         df["NO"] = range(1, len(df) + 1)
 
+        return df
+
+
+class OfficetelTradeAPI:
+    """오피스텔 매매 실거래가 API 클라이언트"""
+
+    BASE_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade"
+
+    def __init__(self, service_key: Optional[str] = None):
+        self.service_key = get_api_key(service_key)
+        if not self.service_key:
+            raise ValueError(
+                "API 서비스키가 필요합니다. "
+                "Streamlit Cloud: Secrets에 API_SERVICE_KEY를 설정하세요. "
+                "로컬: .env 파일에 API_SERVICE_KEY를 설정하거나 직접 전달해주세요."
+            )
+
+    def fetch_data(self, region_code: str, deal_year_month: str,
+                   page_no: int = 1, num_of_rows: int = 1000) -> Dict:
+        params = {
+            "serviceKey": self.service_key,
+            "LAWD_CD": region_code,
+            "DEAL_YMD": deal_year_month,
+            "pageNo": page_no,
+            "numOfRows": num_of_rows,
+        }
+        try:
+            response = requests.get(self.BASE_URL, params=params, timeout=30)
+            response.raise_for_status()
+            return self._parse_xml_response(response.text)
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e), "items": [], "total_count": 0}
+
+    def _parse_xml_response(self, xml_text: str) -> Dict:
+        try:
+            root = ET.fromstring(xml_text)
+            header = root.find(".//header")
+            if header is not None:
+                result_code = header.findtext("resultCode", "")
+                result_msg = header.findtext("resultMsg", "")
+                if result_code != "00" and result_code != "000":
+                    return {"error": f"API 오류 [{result_code}]: {result_msg}", "items": [], "total_count": 0}
+            items = []
+            body = root.find(".//body")
+            if body is not None:
+                total_count = int(body.findtext("totalCount", "0"))
+                for item in body.findall(".//item"):
+                    item_data = {}
+                    for child in item:
+                        item_data[child.tag] = child.text.strip() if child.text else ""
+                    items.append(item_data)
+                return {"items": items, "total_count": total_count,
+                        "page_no": int(body.findtext("pageNo", "1")),
+                        "num_of_rows": int(body.findtext("numOfRows", "10"))}
+            return {"items": [], "total_count": 0}
+        except ET.ParseError as e:
+            return {"error": f"XML 파싱 오류: {str(e)}", "items": [], "total_count": 0}
+
+    def fetch_all_pages(self, region_code: str, deal_year_month: str,
+                        progress_callback=None) -> List[Dict]:
+        all_items = []
+        page_no = 1
+        num_of_rows = 1000
+        result = self.fetch_data(region_code, deal_year_month, page_no, num_of_rows)
+        if "error" in result:
+            return []
+        all_items.extend(result.get("items", []))
+        total_count = result.get("total_count", 0)
+        if progress_callback:
+            progress_callback(len(all_items), total_count)
+        while len(all_items) < total_count:
+            page_no += 1
+            time.sleep(0.1)
+            result = self.fetch_data(region_code, deal_year_month, page_no, num_of_rows)
+            if "error" in result or not result.get("items"):
+                break
+            all_items.extend(result["items"])
+            if progress_callback:
+                progress_callback(len(all_items), total_count)
+        return all_items
+
+    def fetch_multiple_months(self, region_code: str, start_year_month: str,
+                               end_year_month: str, progress_callback=None) -> pd.DataFrame:
+        months = self._generate_month_range(start_year_month, end_year_month)
+        all_items = []
+        for idx, month in enumerate(months):
+            if progress_callback:
+                progress_callback(idx + 1, len(months), len(all_items))
+            items = self.fetch_all_pages(region_code, month)
+            all_items.extend(items)
+            time.sleep(0.2)
+        if not all_items:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_items)
+        df = self._preprocess_dataframe(df)
+        return df
+
+    def _generate_month_range(self, start: str, end: str) -> List[str]:
+        start_year, start_month = int(start[:4]), int(start[4:])
+        end_year, end_month = int(end[:4]), int(end[4:])
+        months = []
+        year, month = start_year, start_month
+        while (year < end_year) or (year == end_year and month <= end_month):
+            months.append(f"{year}{month:02d}")
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        return months
+
+    def _preprocess_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        # 오피스텔 API 응답 컬럼명 매핑 (offiNm이 단지명에 해당)
+        column_mapping = {
+            "sggCd": "지역코드",
+            "umdNm": "법정동",
+            "offiNm": "단지명",
+            "jibun": "지번",
+            "excluUseAr": "전용면적(㎡)",
+            "dealYear": "계약년도",
+            "dealMonth": "계약월",
+            "dealDay": "계약일",
+            "dealAmount": "거래금액(만원)",
+            "floor": "층",
+            "buildYear": "건축년도",
+            "cdealType": "해제여부",
+            "cdealDay": "해제사유발생일",
+            "dealingGbn": "거래유형",
+            "estateAgentSggNm": "중개사소재지",
+            "rgstDate": "등기일자",
+            "slerGbn": "매도자",
+            "buyerGbn": "매수자",
+        }
+        rename_dict = {k: v for k, v in column_mapping.items() if k in df.columns}
+        df = df.rename(columns=rename_dict)
+        if "거래금액(만원)" in df.columns:
+            df["거래금액(만원)"] = df["거래금액(만원)"].str.replace(",", "").astype(int)
+        if "전용면적(㎡)" in df.columns:
+            df["전용면적(㎡)"] = pd.to_numeric(df["전용면적(㎡)"], errors="coerce")
+        if "층" in df.columns:
+            df["층"] = pd.to_numeric(df["층"], errors="coerce")
+        if "건축년도" in df.columns:
+            df["건축년도"] = pd.to_numeric(df["건축년도"], errors="coerce")
+        if all(col in df.columns for col in ["계약년도", "계약월"]):
+            df["계약년월"] = df["계약년도"].astype(str) + df["계약월"].astype(str).str.zfill(2)
+            df["계약년월"] = pd.to_numeric(df["계약년월"], errors="coerce")
+        if "법정동" in df.columns:
+            df["시군구"] = df.get("지역코드", "") + " " + df["법정동"]
+        df["NO"] = range(1, len(df) + 1)
         return df
 
 
